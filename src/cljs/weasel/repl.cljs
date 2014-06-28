@@ -1,8 +1,12 @@
 (ns weasel.repl
+  (:require-macros [cljs.core.async.macros :refer [go]])
   (:require [clojure.browser.event :as event :refer [event-types]]
             [clojure.browser.net :as net]
             [cljs.reader :as reader :refer [read-string]]
-            [weasel.impls.websocket :as ws]))
+            [cljs.core.async :refer [<! put! chan]]
+            [weasel.impls.websocket :as ws]
+            [khroma.devtools :as devtools]
+            [khroma.util :as kutil]))
 
 (def ^:private ws-connection (atom nil))
 
@@ -16,25 +20,31 @@
 (defmethod process-message
   :error
   [message]
-  (.error js/console (str "Websocket REPL error " (:type message))))
+  (let [out (chan)]
+    (.error js/console (str "Websocket REPL error " (:type message)))
+    (put! out (kutil/escape-nil nil))
+    out))
 
 (defmethod process-message
   :eval-js
   [message]
-  (let [code (:code message)]
-    {:op :result
-     :value (try
-              {:status :success, :value (str (js* "eval(~{code})"))}
-              (catch js/Error e
-                {:status :exception
-                 :value (pr-str e)
-                 :stacktrace (if (.hasOwnProperty e "stack")
-                               (.-stack e)
-                               "No stacktrace available.")})
-              (catch :default e
-                {:status :exception
-                 :value (pr-str e)
-                 :stacktrace "No stacktrace available."}))}))
+  (let [code (:code message)
+        out (chan)]
+    (go (put! out
+      {:op :result
+       :value (try
+                {:status :success, :value (str (<! (devtools/inspected-eval! code)))}
+                (catch js/Error e
+                  {:status :exception
+                   :value (pr-str e)
+                   :stacktrace (if (.hasOwnProperty e "stack")
+                                 (.-stack e)
+                                 "No stacktrace available.")})
+                (catch :default e
+                  {:status :exception
+                   :value (pr-str e)
+                   :stacktrace "No stacktrace available."}))}))
+    out))
 
 (defn repl-print
   [& args]
@@ -65,9 +75,15 @@
 
     (event/listen repl-connection :message
       (fn [evt]
-        (let [{:keys [op] :as message} (read-string (.-message evt))
-              response (-> message process-message pr-str)]
-          (net/transmit repl-connection response))))
+        (go
+          (let [{:keys [op] :as message} (read-string (.-message evt))
+                response (-> message
+                             process-message
+                             <!
+                             kutil/unescape-nil
+                             pr-str)]
+
+              (net/transmit repl-connection response)))))
 
     (event/listen repl-connection :closed
       (fn [evt]
